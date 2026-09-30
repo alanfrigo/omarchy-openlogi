@@ -1,0 +1,1104 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 3a5837f3d188dd2a88629a8dc93d27aada191172..426d9a62c002226936280a27375183fe79067ecb 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -5906,6 +5906,8 @@ dependencies = [
+  "openlogi-ui",
+  "raw-window-handle",
+  "rust-i18n",
++ "serde",
++ "serde_json",
+  "succession",
+  "tarpc",
+  "tokio",
+diff --git a/crates/openlogi-agent/src/overlay.rs b/crates/openlogi-agent/src/overlay.rs
+index 5804a00456ba656dcf01713b64a2a827e6766e6d..84c7e5dc2ba5703863e72e00bed3716a3bf938ee 100644
+--- a/crates/openlogi-agent/src/overlay.rs
++++ b/crates/openlogi-agent/src/overlay.rs
+@@ -23,6 +23,17 @@ use tracing::{info, warn};
+ 
+ /// Start the overlay supervisor on a dedicated thread.
+ pub fn spawn() {
++    match std::env::var(openlogi_core::env::OVERLAY_BACKEND).as_deref() {
++        Ok("external") => {
++            info!("Actions Ring uses an external renderer");
++            return;
++        }
++        Ok("native") | Err(std::env::VarError::NotPresent) => {}
++        _ => {
++            tracing::error!("Invalid OPENLOGI_OVERLAY_BACKEND; overlay disabled");
++            return;
++        }
++    }
+     let Some(binary) = overlay_binary_path() else {
+         warn!("Actions Ring overlay binary not found — overlay disabled");
+         return;
+diff --git a/crates/openlogi-core/src/env.rs b/crates/openlogi-core/src/env.rs
+index 6b0480398a1e3fe142c78885c5f44b653a60fc98..b1599663b18c77ce75c1ea90a6abe007f951c0aa 100644
+--- a/crates/openlogi-core/src/env.rs
++++ b/crates/openlogi-core/src/env.rs
+@@ -25,3 +25,6 @@ pub const ASSETS: &str = "OPENLOGI_ASSETS";
+ /// Pins the GUI's device renders to one depot regardless of what is attached
+ /// — a development convenience read in two places.
+ pub const FORCE_DEPOT: &str = "OPENLOGI_FORCE_DEPOT";
++
++/// Selects the Actions Ring renderer: `native` (default) or `external`.
++pub const OVERLAY_BACKEND: &str = "OPENLOGI_OVERLAY_BACKEND";
+diff --git a/crates/openlogi-overlay/Cargo.toml b/crates/openlogi-overlay/Cargo.toml
+index d9fb13a8f8c6c780d5d63686f48e6dc658df6ca9..0f5a7d42ab118af6d901445a10c76f59b572f787 100644
+--- a/crates/openlogi-overlay/Cargo.toml
++++ b/crates/openlogi-overlay/Cargo.toml
+@@ -23,9 +23,11 @@ anyhow = { workspace = true }
+ gpui = { workspace = true }
+ gpui_platform = { workspace = true }
+ rust-i18n = "4"
++serde = { workspace = true }
++serde_json = { workspace = true }
+ succession = "0.2"
+ tarpc = { workspace = true }
+-tokio = { workspace = true }
++tokio = { workspace = true, features = ["io-util", "net", "signal"] }
+ tracing = { workspace = true }
+ 
+ [build-dependencies]
+diff --git a/crates/openlogi-overlay/src/ipc.rs b/crates/openlogi-overlay/src/ipc.rs
+index c0872f8c887cf130c8e82db8728f119ee1c4f07e..b40ba6f76d58002015e5600e547f2cf34d93b982 100644
+--- a/crates/openlogi-overlay/src/ipc.rs
++++ b/crates/openlogi-overlay/src/ipc.rs
+@@ -11,6 +11,7 @@
+ use std::{
+     future::Future,
+     pin::Pin,
++    sync::Arc,
+     time::{Duration, Instant},
+ };
+ 
+@@ -20,7 +21,7 @@ use openlogi_ipc::client::{self, ConnectError, Observer};
+ use openlogi_ipc::{ActionRingInvocation, AgentClient, ClientKind, RingObservation};
+ use succession::Standing;
+ use tarpc::context;
+-use tokio::sync::mpsc;
++use tokio::sync::{mpsc, watch};
+ use tracing::{debug, info, warn};
+ 
+ use crate::session::allegiance;
+@@ -78,23 +79,50 @@ pub(crate) fn spawn() -> Handle {
+     }
+ }
+ 
+-async fn connect() -> Option<AgentClient> {
++/// Why no usable connection to the agent exists right now.
++#[derive(Debug)]
++pub(crate) enum LinkFailure {
++    /// No agent answered; worth retrying.
++    Unreachable,
++    /// The agent speaks another protocol; this binary cannot serve it.
++    Incompatible(String),
++    /// The agent is a different run than the one this process serves.
++    Superseded(String),
++}
++
++/// Connect as the overlay and check that the agent is the run this process
++/// serves. Callers decide what each failure means for their lifecycle.
++pub(crate) async fn connect_checked() -> Result<AgentClient, LinkFailure> {
+     // Declaring as an overlay is part of the handshake: an overlay
+     // reconnecting on its own is an orphan of a previous run and must not wake
+     // a dormant agent — an armed agent spawns its own overlay.
+     let client = match client::connect_as(ClientKind::Overlay).await {
+         Ok(client) => client,
+         // A mismatch in either direction is not transient — this binary is
+-        // from a superseded install, and the agent will start the overlay
+-        // that matches it as soon as this one releases the role.
+-        Err(ConnectError::Skew(skew)) => stand_down(&skew.to_string()),
+-        Err(_) => return None,
++        // from a superseded install.
++        Err(ConnectError::Skew(skew)) => return Err(LinkFailure::Incompatible(skew.to_string())),
++        Err(_) => return Err(LinkFailure::Unreachable),
+     };
+-    let identity = client.identity(context::current()).await.ok()?;
++    let identity = client
++        .identity(context::current())
++        .await
++        .map_err(|_| LinkFailure::Unreachable)?;
+     if let Standing::Superseded(because) = allegiance().observe(identity) {
+-        stand_down(&because.to_string());
++        return Err(LinkFailure::Superseded(because.to_string()));
++    }
++    Ok(client)
++}
++
++async fn connect() -> Option<AgentClient> {
++    match connect_checked().await {
++        Ok(client) => Some(client),
++        Err(LinkFailure::Unreachable) => None,
++        // The agent will start the overlay that matches it as soon as this
++        // one releases the role.
++        Err(LinkFailure::Incompatible(because) | LinkFailure::Superseded(because)) => {
++            stand_down(&because)
++        }
+     }
+-    Some(client)
+ }
+ 
+ /// Exit, releasing the overlay role.
+@@ -199,6 +227,9 @@ async fn observe_invocations(tx: mpsc::UnboundedSender<Option<ActionRingInvocati
+             }
+             Err(error) => {
+                 debug!(?error, "Actions Ring state channel disconnected");
++                if tx.send(None).is_err() {
++                    return;
++                }
+                 link.disconnected();
+             }
+         }
+@@ -256,6 +287,31 @@ async fn send_commands(rx: &mut mpsc::UnboundedReceiver<OverlayCommand>) {
+     .await;
+ }
+ 
++/// [`send_commands`] for a process that decides its own lifecycle: link
++/// failures are retried within the command deadline instead of exiting, and
++/// every delivered terminal command is published to `delivered`, so shutdown
++/// can wait for the last one instead of abandoning it.
++pub(crate) async fn send_commands_reporting(
++    rx: &mut mpsc::UnboundedReceiver<OverlayCommand>,
++    delivered: Arc<watch::Sender<Option<OverlayCommand>>>,
++) {
++    send_commands_with(
++        rx,
++        || Box::pin(async { connect_checked().await.ok() }),
++        move |client, command| {
++            let delivered = Arc::clone(&delivered);
++            Box::pin(async move {
++                let sent = send_command(client, command).await;
++                if sent && command.is_terminal() {
++                    delivered.send_replace(Some(command));
++                }
++                sent
++            })
++        },
++    )
++    .await;
++}
++
+ async fn send_commands_with<C>(
+     rx: &mut mpsc::UnboundedReceiver<OverlayCommand>,
+     mut connect_client: impl FnMut() -> CommandFuture<'static, Option<C>>,
+diff --git a/crates/openlogi-overlay/src/main.rs b/crates/openlogi-overlay/src/main.rs
+index e27326eb62836f9513611c38f4baa70274854f31..f365d97bf136ab7db9308a4b0883cf5c371bef68 100644
+--- a/crates/openlogi-overlay/src/main.rs
++++ b/crates/openlogi-overlay/src/main.rs
+@@ -18,6 +18,8 @@ mod ipc;
+ mod platform;
+ mod ring;
+ mod session;
++#[cfg(target_os = "linux")]
++mod stdio;
+ 
+ use std::sync::Arc;
+ 
+@@ -33,6 +35,9 @@ use crate::ring::RingView;
+ use crate::session::{ClickAwaySession, claim_the_role, spawn_click_away_dismissal};
+ 
+ fn main() -> Result<()> {
++    if let Some(outcome) = run_without_gpui() {
++        return outcome;
++    }
+     openlogi_core::logging::init_stderr();
+ 
+     openlogi_core::locale::activate(None);
+@@ -116,5 +121,43 @@ fn main() -> Result<()> {
+     Ok(())
+ }
+ 
++/// Handle the options that never open a GPUI window; `Some` is the whole run.
++///
++/// Decided before the role is claimed: `--help` and a refused mode must not
++/// hold it, and `--stdio` must not start GPUI at all.
++fn run_without_gpui() -> Option<Result<()>> {
++    match std::env::args_os().skip(1).collect::<Vec<_>>().as_slice() {
++        [] => None,
++        [help] if help == "--help" => {
++            println!(
++                "Usage: openlogi-overlay [--stdio]\n\n\
++                 Without options, draws the Actions Ring in its own GPUI window.\n\
++                 --stdio  Serve the ring to an external renderer over JSON Lines on\n\
++                 \x20        stdin/stdout (Linux; requires {}=external).",
++                openlogi_core::env::OVERLAY_BACKEND
++            );
++            Some(Ok(()))
++        }
++        [mode] if mode == "--stdio" => Some(run_stdio()),
++        _ => Some(Err(anyhow::anyhow!("unknown option; see --help"))),
++    }
++}
++
++#[cfg(target_os = "linux")]
++fn run_stdio() -> Result<()> {
++    anyhow::ensure!(
++        std::env::var(openlogi_core::env::OVERLAY_BACKEND).as_deref() == Ok("external"),
++        "--stdio requires {}=external",
++        openlogi_core::env::OVERLAY_BACKEND
++    );
++    openlogi_core::logging::init_stderr();
++    stdio::run()
++}
++
++#[cfg(not(target_os = "linux"))]
++fn run_stdio() -> Result<()> {
++    anyhow::bail!("--stdio is available only on Linux")
++}
++
+ #[cfg(test)]
+ mod tests;
+diff --git a/crates/openlogi-overlay/src/ring.rs b/crates/openlogi-overlay/src/ring.rs
+index 5e4efd62418c5aedfb10253962eb8c8c36a0efa1..a30b6191bd725dfb38406041a4f8ed85efdf95c5 100644
+--- a/crates/openlogi-overlay/src/ring.rs
++++ b/crates/openlogi-overlay/src/ring.rs
+@@ -25,6 +25,16 @@ pub(crate) const WINDOW_SIZE: f32 = 360.0;
+ pub(crate) const SLOT_SIZE: f32 = 54.0;
+ pub(crate) const RADIUS: f32 = 122.0;
+ 
++pub(crate) fn presentation_label(presentation: &openlogi_ipc::ActionRingPresentation) -> String {
++    if presentation.literal {
++        presentation.label.clone()
++    } else if let Some(key) = Action::translation_key_for_label(&presentation.label) {
++        rust_i18n::t!(key).into_owned()
++    } else {
++        presentation.label.clone()
++    }
++}
++
+ /// The ring's own neutral scale. It floats over whatever is on the desktop, so
+ /// unlike the settings app it cannot take its surfaces from the OS appearance —
+ /// it commits to a dark panel and rides its own contrast. Only the accent is
+@@ -152,17 +162,7 @@ impl Render for RingView {
+         let center_commands = self.commands.clone();
+         let hovered_label = self.hovered.and_then(|slot| {
+             let presentation = self.invocation.slots.get(&slot)?;
+-            // User-authored labels render verbatim: passing them through the
+-            // localization table would translate any label that happens to
+-            // collide with a known key ("Copy" → "Copier" under fr).
+-            let label = if presentation.literal {
+-                presentation.label.clone()
+-            } else if let Some(key) = Action::translation_key_for_label(&presentation.label) {
+-                rust_i18n::t!(key).into_owned()
+-            } else {
+-                presentation.label.clone()
+-            };
+-            Some(SharedString::from(label))
++            Some(SharedString::from(presentation_label(presentation)))
+         });
+         let slots = ActionRingSlot::ALL
+             .into_iter()
+diff --git a/crates/openlogi-overlay/src/stdio.rs b/crates/openlogi-overlay/src/stdio.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..ffe9ae8de1bcf43541c1921efda412a436a6227f
+--- /dev/null
++++ b/crates/openlogi-overlay/src/stdio.rs
+@@ -0,0 +1,631 @@
++//! The Actions Ring for an external renderer, over a private JSON Lines pipe.
++//!
++//! A parent process — the Omarchy shell — draws the ring on its own
++//! layer-shell surface and speaks to this process over stdin/stdout only. The
++//! parent sees presentation and a session id; the agent still validates and
++//! executes every action, so nothing the parent writes can name one.
++//!
++//! Both pipe ends are switched to non-blocking mode and driven by the runtime,
++//! so no read or write can park a thread past shutdown: a silent parent, a
++//! stalled reader, and a closed pipe all end this process within its deadlines.
++
++use std::collections::BTreeSet;
++use std::os::fd::AsFd as _;
++use std::sync::Arc;
++use std::time::{Duration, Instant};
++
++use anyhow::{Context as _, Result, anyhow, bail};
++use gpui::AssetSource as _;
++use openlogi_core::action_ring::DISPLAY_LIFETIME;
++use openlogi_core::binding::ActionRingSlot;
++use openlogi_ipc::client::Observer;
++use openlogi_ipc::{ActionRingInvocation, AgentSnapshot, InventoryHealth};
++use openlogi_ui::action_icons::ActionIcons;
++use serde::{Deserialize, Serialize};
++use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
++use tokio::net::unix::pipe;
++use tokio::signal::unix::{SignalKind, signal};
++use tokio::sync::{mpsc, watch};
++use tracing::{info, warn};
++
++use crate::ipc::{self, LinkFailure, OverlayCommand};
++use crate::ring::{RADIUS, SLOT_SIZE, WINDOW_SIZE, presentation_label};
++
++/// Version of the line protocol, announced in the first line.
++const PROTOCOL: u32 = 1;
++
++/// Longest command line accepted, newline excluded.
++const MAX_LINE: usize = 4096;
++
++/// How long one stdout write, or the final cancellation, may take.
++const PIPE_DEADLINE: Duration = Duration::from_secs(2);
++
++/// How long to wait between attempts to reach an agent.
++const RETRY_PERIOD: Duration = Duration::from_secs(1);
++
++/// A command from the renderer. Ids travel as decimal strings because a
++/// JavaScript number cannot hold every `u64`.
++#[derive(Debug, Deserialize)]
++#[serde(tag = "type", rename_all = "lowercase", deny_unknown_fields)]
++enum Input {
++    Hover {
++        #[serde(rename = "sessionId")]
++        session_id: String,
++        slot: ActionRingSlot,
++    },
++    Activate {
++        #[serde(rename = "sessionId")]
++        session_id: String,
++        slot: ActionRingSlot,
++    },
++    Cancel {
++        #[serde(rename = "sessionId")]
++        session_id: String,
++    },
++}
++
++#[derive(Serialize)]
++#[serde(tag = "type", rename_all = "lowercase")]
++enum Output<'a> {
++    Hello {
++        version: u32,
++        #[serde(rename = "displayLifetimeMs")]
++        display_lifetime_ms: u64,
++    },
++    Status(&'a Status),
++    Ring {
++        invocation: Option<RingMessage>,
++    },
++    Error {
++        message: String,
++    },
++}
++
++#[derive(Serialize)]
++#[serde(rename_all = "camelCase")]
++pub(crate) struct RingMessage {
++    pub(crate) session_id: String,
++    pub(crate) slots: Vec<SlotMessage>,
++}
++
++#[derive(Serialize)]
++#[serde(rename_all = "camelCase")]
++pub(crate) struct SlotMessage {
++    pub(crate) slot: ActionRingSlot,
++    pub(crate) label: String,
++    pub(crate) icon_svg: String,
++    pub(crate) x: f32,
++    pub(crate) y: f32,
++}
++
++/// What the renderer is told about the agent and the devices it reaches.
++#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
++pub(crate) struct Status {
++    agent: &'static str,
++    inventory: &'static str,
++    devices: Vec<String>,
++}
++
++impl Status {
++    const fn empty(agent: &'static str) -> Self {
++        Self {
++            agent,
++            inventory: "unknown",
++            devices: Vec::new(),
++        }
++    }
++
++    /// Names of the online devices, never receivers or serial numbers.
++    pub(crate) fn of(snapshot: &AgentSnapshot) -> Self {
++        let paired = snapshot.inventory.iter().flat_map(|group| {
++            group
++                .paired
++                .iter()
++                .filter(|device| device.online)
++                .map(|device| device.codename.as_ref().unwrap_or(&group.receiver.name))
++        });
++        let standalone = snapshot
++            .standalone
++            .iter()
++            .filter(|device| device.online)
++            .map(|device| &device.display_name);
++        Self {
++            agent: "connected",
++            inventory: match snapshot.status.inventory {
++                InventoryHealth::Scanning => "scanning",
++                InventoryHealth::Ready => "ready",
++                InventoryHealth::Unavailable => "unavailable",
++            },
++            devices: paired.chain(standalone).cloned().collect(),
++        }
++    }
++}
++
++struct Showing {
++    id: u64,
++    slots: BTreeSet<ActionRingSlot>,
++    until: Instant,
++}
++
++/// The one ring the renderer may interact with, and the last one that ended
++/// here. Routing and timeout only: the actions stay in the agent.
++#[derive(Default)]
++pub(crate) struct Session {
++    showing: Option<Showing>,
++    ended: Option<u64>,
++}
++
++impl Session {
++    /// Show `invocation` from `now`. `false` when there is nothing new to
++    /// present: it is already showing, or it already ended here and a late
++    /// observation must not reopen it.
++    pub(crate) fn show(&mut self, invocation: &ActionRingInvocation, now: Instant) -> bool {
++        let id = invocation.session_id;
++        if self.ended == Some(id) || self.showing.as_ref().is_some_and(|ring| ring.id == id) {
++            return false;
++        }
++        self.forget();
++        self.showing = Some(Showing {
++            id,
++            slots: invocation.slots.keys().copied().collect(),
++            until: now + DISPLAY_LIFETIME,
++        });
++        true
++    }
++
++    /// The agent dismissed the ring; there is nothing to acknowledge.
++    pub(crate) fn forget(&mut self) {
++        if let Some(ring) = self.showing.take() {
++            self.ended = Some(ring.id);
++        }
++    }
++
++    /// End the showing ring on this process's own authority.
++    pub(crate) fn cancel(&mut self) -> Option<OverlayCommand> {
++        let session_id = self.showing.as_ref()?.id;
++        self.forget();
++        Some(OverlayCommand::Cancel { session_id })
++    }
++
++    /// When the showing ring expires.
++    fn deadline(&self) -> Option<Instant> {
++        self.showing.as_ref().map(|ring| ring.until)
++    }
++
++    /// Cancel the showing ring if its display lifetime is over at `now`.
++    pub(crate) fn expire(&mut self, now: Instant) -> Option<OverlayCommand> {
++        if self.deadline().is_some_and(|until| until <= now) {
++            self.cancel()
++        } else {
++            None
++        }
++    }
++
++    /// Turn one renderer line into the command it asks for, or say why not.
++    /// A terminal command ends the session here, so a repeat is refused.
++    pub(crate) fn command(&mut self, line: &str, now: Instant) -> Result<OverlayCommand> {
++        let input: Input = serde_json::from_str(line).context("invalid command")?;
++        let (raw, slot) = match &input {
++            Input::Hover { session_id, slot } | Input::Activate { session_id, slot } => {
++                (session_id, Some(*slot))
++            }
++            Input::Cancel { session_id } => (session_id, None),
++        };
++        let session_id = parse_session_id(raw)?;
++        let ring = self
++            .showing
++            .as_ref()
++            .filter(|ring| ring.id == session_id && now < ring.until)
++            .ok_or_else(|| anyhow!("session {session_id} is not interactive"))?;
++        if let Some(slot) = slot
++            && !ring.slots.contains(&slot)
++        {
++            bail!("slot {slot:?} is empty in session {session_id}");
++        }
++        let command = match input {
++            Input::Hover { slot, .. } => OverlayCommand::Hover { session_id, slot },
++            Input::Activate { slot, .. } => OverlayCommand::Activate { session_id, slot },
++            Input::Cancel { .. } => OverlayCommand::Cancel { session_id },
++        };
++        if command.is_terminal() {
++            self.forget();
++        }
++        Ok(command)
++    }
++}
++
++fn parse_session_id(raw: &str) -> Result<u64> {
++    if raw.is_empty() || !raw.bytes().all(|byte| byte.is_ascii_digit()) {
++        bail!("sessionId must be a decimal string");
++    }
++    match raw.parse() {
++        Ok(0) | Err(_) => bail!("sessionId is out of range"),
++        Ok(id) => Ok(id),
++    }
++}
++
++/// The presentation the renderer draws, localized and with embedded glyphs.
++pub(crate) fn ring_message(invocation: &ActionRingInvocation) -> Result<RingMessage> {
++    openlogi_core::locale::activate(invocation.language.as_deref());
++    let mut slots = Vec::with_capacity(invocation.slots.len());
++    for slot in ActionRingSlot::ALL {
++        let Some(presentation) = invocation.slots.get(&slot) else {
++            continue;
++        };
++        let path = presentation.icon.asset_path();
++        let icon = ActionIcons
++            .load(path)?
++            .ok_or_else(|| anyhow!("embedded icon {path} is missing"))?;
++        let (x, y) = slot.placement(WINDOW_SIZE, RADIUS, SLOT_SIZE);
++        slots.push(SlotMessage {
++            slot,
++            label: presentation_label(presentation),
++            icon_svg: String::from_utf8(icon.into_owned()).context("icon is not UTF-8")?,
++            x,
++            y,
++        });
++    }
++    Ok(RingMessage {
++        session_id: invocation.session_id.to_string(),
++        slots,
++    })
++}
++
++enum Line {
++    Text(String),
++    NotUtf8,
++    TooLong,
++}
++
++/// Feed stdin to `lines` one bounded line at a time. Closing the channel is
++/// end of input.
++async fn read_lines(input: pipe::Receiver, lines: mpsc::Sender<Line>) {
++    let mut reader = BufReader::with_capacity(MAX_LINE, input);
++    loop {
++        let line = match read_line(&mut reader).await {
++            Ok(Some(line)) => line,
++            Ok(None) => return,
++            Err(error) => {
++                warn!(%error, "stdin failed");
++                return;
++            }
++        };
++        let fatal = matches!(line, Line::TooLong);
++        if lines.send(line).await.is_err() || fatal {
++            return;
++        }
++    }
++}
++
++async fn read_line(reader: &mut BufReader<pipe::Receiver>) -> std::io::Result<Option<Line>> {
++    let mut line = Vec::new();
++    loop {
++        let available = reader.fill_buf().await?;
++        if available.is_empty() {
++            return Ok((!line.is_empty()).then(|| text(line)));
++        }
++        let newline = available.iter().position(|byte| *byte == b'\n');
++        let content = newline.unwrap_or(available.len());
++        if line.len() + content > MAX_LINE {
++            return Ok(Some(Line::TooLong));
++        }
++        line.extend_from_slice(&available[..content]);
++        reader.consume(newline.map_or(content, |index| index + 1));
++        if newline.is_some() {
++            return Ok(Some(text(line)));
++        }
++    }
++}
++
++fn text(bytes: Vec<u8>) -> Line {
++    String::from_utf8(bytes).map_or(Line::NotUtf8, Line::Text)
++}
++
++enum Event {
++    Ring(Option<ActionRingInvocation>),
++    Status(Status),
++    Ended(LinkFailure),
++}
++
++async fn watch_ring(events: mpsc::Sender<Event>) {
++    loop {
++        match ipc::connect_checked().await {
++            Ok(client) => {
++                let mut observer = Observer::action_ring(client);
++                while let Ok(answer) = observer.next().await {
++                    if let Some(ring) = answer
++                        && events.send(Event::Ring(ring.invocation)).await.is_err()
++                    {
++                        return;
++                    }
++                }
++                // A ring from a lost connection can no longer be answered.
++                if events.send(Event::Ring(None)).await.is_err() {
++                    return;
++                }
++            }
++            Err(LinkFailure::Unreachable) => {}
++            Err(failure) => {
++                let _ = events.send(Event::Ended(failure)).await;
++                return;
++            }
++        }
++        tokio::time::sleep(RETRY_PERIOD).await;
++    }
++}
++
++async fn watch_status(events: mpsc::Sender<Event>) {
++    loop {
++        match ipc::connect_checked().await {
++            Ok(client) => {
++                if events
++                    .send(Event::Status(Status::empty("connected")))
++                    .await
++                    .is_err()
++                {
++                    return;
++                }
++                let mut observer = Observer::state(client);
++                while let Ok(answer) = observer.next().await {
++                    if let Some(observation) = answer
++                        && events
++                            .send(Event::Status(Status::of(&observation.snapshot)))
++                            .await
++                            .is_err()
++                    {
++                        return;
++                    }
++                }
++            }
++            Err(LinkFailure::Unreachable) => {}
++            Err(failure) => {
++                let _ = events.send(Event::Ended(failure)).await;
++                return;
++            }
++        }
++        if events
++            .send(Event::Status(Status::empty("unavailable")))
++            .await
++            .is_err()
++        {
++            return;
++        }
++        tokio::time::sleep(RETRY_PERIOD).await;
++    }
++}
++
++/// How a bridge run ended without an error of its own.
++enum Exit {
++    EndOfInput,
++    Terminated,
++    Superseded(String),
++}
++
++struct Bridge {
++    stdout: pipe::Sender,
++    commands: mpsc::UnboundedSender<OverlayCommand>,
++    session: Session,
++    status: Option<Status>,
++    /// The last terminal command handed to the worker, awaited at shutdown.
++    last_terminal: Option<OverlayCommand>,
++}
++
++impl Bridge {
++    async fn write(&mut self, output: &Output<'_>) -> Result<()> {
++        let mut line = serde_json::to_vec(output)?;
++        line.push(b'\n');
++        tokio::time::timeout(PIPE_DEADLINE, self.stdout.write_all(&line))
++            .await
++            .context("stdout stalled")?
++            .context("stdout closed")
++    }
++
++    async fn error(&mut self, message: String) -> Result<()> {
++        self.write(&Output::Error { message }).await
++    }
++
++    async fn closed(&mut self) -> Result<()> {
++        self.write(&Output::Ring { invocation: None }).await
++    }
++
++    async fn status(&mut self, status: Status) -> Result<()> {
++        if self.status.as_ref() == Some(&status) {
++            return Ok(());
++        }
++        self.write(&Output::Status(&status)).await?;
++        self.status = Some(status);
++        Ok(())
++    }
++
++    fn send(&mut self, command: OverlayCommand) -> Result<()> {
++        if command.is_terminal() {
++            self.last_terminal = Some(command);
++        }
++        self.commands
++            .send(command)
++            .map_err(|_| anyhow!("the command worker stopped"))
++    }
++
++    async fn line(&mut self, line: Line) -> Result<()> {
++        let parsed = match line {
++            Line::Text(line) => self.session.command(&line, Instant::now()),
++            Line::NotUtf8 => Err(anyhow!("command is not UTF-8")),
++            Line::TooLong => {
++                self.error(format!("command exceeds {MAX_LINE} bytes"))
++                    .await?;
++                bail!("command exceeds {MAX_LINE} bytes");
++            }
++        };
++        match parsed {
++            Ok(command) => {
++                self.send(command)?;
++                if command.is_terminal() {
++                    self.closed().await?;
++                }
++                Ok(())
++            }
++            Err(error) => self.error(format!("{error:#}")).await,
++        }
++    }
++
++    async fn event(&mut self, event: Event) -> Result<Option<Exit>> {
++        match event {
++            Event::Ring(Some(invocation)) => {
++                if !self.session.show(&invocation, Instant::now()) {
++                    return Ok(None);
++                }
++                match ring_message(&invocation) {
++                    Ok(ring) => {
++                        self.write(&Output::Ring {
++                            invocation: Some(ring),
++                        })
++                        .await?;
++                    }
++                    Err(error) => {
++                        if let Some(command) = self.session.cancel() {
++                            self.send(command)?;
++                        }
++                        self.error(format!("could not present the Actions Ring: {error:#}"))
++                            .await?;
++                    }
++                }
++            }
++            Event::Ring(None) => {
++                self.session.forget();
++                self.closed().await?;
++            }
++            Event::Status(status) => self.status(status).await?,
++            Event::Ended(LinkFailure::Incompatible(because)) => {
++                self.status(Status::empty("incompatible")).await?;
++                self.error(because.clone()).await?;
++                bail!("the agent is incompatible: {because}");
++            }
++            Event::Ended(LinkFailure::Superseded(because)) => {
++                self.session.forget();
++                self.closed().await?;
++                self.error(because.clone()).await?;
++                return Ok(Some(Exit::Superseded(because)));
++            }
++            Event::Ended(LinkFailure::Unreachable) => {}
++        }
++        Ok(None)
++    }
++
++    async fn run(
++        &mut self,
++        lines: &mut mpsc::Receiver<Line>,
++        events: &mut mpsc::Receiver<Event>,
++    ) -> Result<Exit> {
++        let mut terminate = signal(SignalKind::terminate())?;
++        self.write(&Output::Hello {
++            version: PROTOCOL,
++            display_lifetime_ms: u64::try_from(DISPLAY_LIFETIME.as_millis())?,
++        })
++        .await?;
++        self.status(Status::empty("connecting")).await?;
++        // A closed stdout has no read-side notification while the agent is
++        // idle. A small status heartbeat also bounds teardown if the parent
++        // closes its read end without closing stdin.
++        let mut heartbeat = tokio::time::interval(Duration::from_secs(1));
++        heartbeat.tick().await;
++        loop {
++            let deadline = self.session.deadline();
++            tokio::select! {
++                _ = heartbeat.tick() => {
++                    if let Some(status) = self.status.clone() {
++                        self.write(&Output::Status(&status)).await?;
++                    }
++                }
++                () = until(deadline) => {
++                    if let Some(command) = self.session.expire(Instant::now()) {
++                        self.send(command)?;
++                        self.closed().await?;
++                    }
++                }
++                _ = terminate.recv() => return Ok(Exit::Terminated),
++                line = lines.recv() => match line {
++                    Some(line) => self.line(line).await?,
++                    None => return Ok(Exit::EndOfInput),
++                },
++                event = events.recv() => {
++                    let event = event.context("the agent observers stopped")?;
++                    if let Some(exit) = self.event(event).await? {
++                        return Ok(exit);
++                    }
++                }
++            }
++        }
++    }
++}
++
++async fn until(deadline: Option<Instant>) {
++    match deadline {
++        Some(deadline) => tokio::time::sleep_until(deadline.into()).await,
++        None => std::future::pending().await,
++    }
++}
++
++async fn serve() -> Result<()> {
++    let input = pipe::Receiver::from_owned_fd(std::io::stdin().as_fd().try_clone_to_owned()?)
++        .context("stdin must be a pipe")?;
++    let stdout = pipe::Sender::from_owned_fd(std::io::stdout().as_fd().try_clone_to_owned()?)
++        .context("stdout must be a pipe")?;
++
++    let (line_tx, mut lines) = mpsc::channel(8);
++    let (event_tx, mut events) = mpsc::channel(8);
++    let (commands, mut command_rx) = mpsc::unbounded_channel();
++    let (delivered_tx, mut delivered) = watch::channel(None);
++    let reader = tokio::spawn(read_lines(input, line_tx));
++    let rings = tokio::spawn(watch_ring(event_tx.clone()));
++    let states = tokio::spawn(watch_status(event_tx));
++    let worker = tokio::spawn(async move {
++        ipc::send_commands_reporting(&mut command_rx, Arc::new(delivered_tx)).await;
++    });
++
++    let mut bridge = Bridge {
++        stdout,
++        commands,
++        session: Session::default(),
++        status: None,
++        last_terminal: None,
++    };
++    let outcome = bridge.run(&mut lines, &mut events).await;
++    reader.abort();
++    rings.abort();
++    states.abort();
++
++    // The worker gives up a command in flight the moment its channel closes,
++    // so the sender stays alive until the last terminal command is delivered
++    // or the deadline passes.
++    if let Some(command) = bridge.session.cancel() {
++        let _ = bridge.send(command);
++    }
++    if let Some(last) = bridge.last_terminal {
++        let delivered = delivered.wait_for(|sent| *sent == Some(last));
++        if tokio::time::timeout(PIPE_DEADLINE, delivered)
++            .await
++            .is_err()
++        {
++            warn!("the agent did not confirm the last Actions Ring command before exit");
++        }
++    }
++    drop(bridge);
++    worker.abort();
++
++    match outcome? {
++        Exit::EndOfInput => info!("stdin closed — leaving the Actions Ring bridge"),
++        Exit::Terminated => info!("terminated — leaving the Actions Ring bridge"),
++        Exit::Superseded(because) => info!("{because} — leaving the Actions Ring bridge"),
++    }
++    Ok(())
++}
++
++/// Serve the ring over stdin/stdout until the parent closes stdin, sends
++/// SIGTERM, stops reading, or the agent is replaced.
++pub(crate) fn run() -> Result<()> {
++    // Declared first so it drops last: observers and the command worker stop
++    // with the runtime before the role is released.
++    let _tenancy = crate::session::claim_the_role()?;
++    let runtime = openlogi_core::worker::runtime()?;
++    runtime.block_on(serve())
++}
+diff --git a/crates/openlogi-overlay/src/tests.rs b/crates/openlogi-overlay/src/tests.rs
+index 21f6b71afa01e99e27c95954af9880d6207b8aaf..73cc98e8ffbf0dc590d10ba0674511b2e6dd4eaa 100644
+--- a/crates/openlogi-overlay/src/tests.rs
++++ b/crates/openlogi-overlay/src/tests.rs
+@@ -8,3 +8,170 @@ fn the_shared_catalog_is_wired_up() {
+     const KEY: &str = "actions.left_click";
+     assert_ne!(rust_i18n::t!(KEY), KEY);
+ }
++
++#[cfg(target_os = "linux")]
++mod stdio {
++    use std::collections::BTreeMap;
++    use std::time::Instant;
++
++    use openlogi_core::action_ring::DISPLAY_LIFETIME;
++    use openlogi_core::binding::{ActionRingIcon, ActionRingSlot};
++    use openlogi_ipc::{ActionRingInvocation, ActionRingPresentation};
++
++    use crate::ipc::OverlayCommand;
++    use crate::ring::{RADIUS, SLOT_SIZE, WINDOW_SIZE};
++    use crate::stdio::{Session, ring_message};
++
++    /// Above 2^53, where a JavaScript number would round it to a neighbour.
++    const BIG: u64 = 9_007_199_254_740_993;
++
++    fn invocation(session_id: u64, slots: &[ActionRingSlot]) -> ActionRingInvocation {
++        ActionRingInvocation {
++            session_id,
++            slots: slots
++                .iter()
++                .map(|slot| {
++                    (
++                        *slot,
++                        ActionRingPresentation {
++                            label: "Copy".into(),
++                            literal: true,
++                            icon: ActionRingIcon::Copy,
++                        },
++                    )
++                })
++                .collect::<BTreeMap<_, _>>(),
++            language: None,
++        }
++    }
++
++    fn showing(session_id: u64, slots: &[ActionRingSlot]) -> (Session, Instant) {
++        let now = Instant::now();
++        let mut session = Session::default();
++        assert!(session.show(&invocation(session_id, slots), now));
++        (session, now)
++    }
++
++    #[test]
++    fn a_session_id_above_2_pow_53_reaches_the_agent_intact() {
++        let (mut session, now) = showing(BIG, &[ActionRingSlot::Top]);
++        let command = session
++            .command(
++                r#"{"type":"activate","sessionId":"9007199254740993","slot":"Top"}"#,
++                now,
++            )
++            .unwrap();
++        assert_eq!(
++            command,
++            OverlayCommand::Activate {
++                session_id: BIG,
++                slot: ActionRingSlot::Top
++            }
++        );
++    }
++
++    #[test]
++    fn a_cancel_for_a_replaced_session_leaves_its_successor_open() {
++        let (mut session, now) = showing(17, &[ActionRingSlot::Top]);
++        assert!(session.show(&invocation(18, &[ActionRingSlot::Top]), now));
++        let stale = session.command(r#"{"type":"cancel","sessionId":"17"}"#, now);
++        assert!(stale.is_err(), "cancelling A must not reach B");
++        let hover = session
++            .command(r#"{"type":"hover","sessionId":"18","slot":"Top"}"#, now)
++            .unwrap();
++        assert_eq!(
++            hover,
++            OverlayCommand::Hover {
++                session_id: 18,
++                slot: ActionRingSlot::Top
++            }
++        );
++    }
++
++    #[test]
++    fn a_repeated_activation_delivers_one_action() {
++        let (mut session, now) = showing(17, &[ActionRingSlot::Top]);
++        let activate = r#"{"type":"activate","sessionId":"17","slot":"Top"}"#;
++        session.command(activate, now).unwrap();
++        assert!(
++            session.command(activate, now).is_err(),
++            "duplicate activation"
++        );
++        let late_hover = session.command(r#"{"type":"hover","sessionId":"17","slot":"Top"}"#, now);
++        assert!(late_hover.is_err(), "hover after the terminal command");
++        assert_eq!(session.cancel(), None);
++    }
++
++    #[test]
++    fn malformed_commands_deliver_nothing_and_keep_the_ring_open() {
++        let (mut session, now) = showing(17, &[ActionRingSlot::Top]);
++        for line in [
++            "not json",
++            r#"{"type":"activate","sessionId":"17","slot":"Middle"}"#,
++            r#"{"type":"activate","sessionId":"17","slot":"Right"}"#,
++            r#"{"type":"activate","sessionId":17,"slot":"Top"}"#,
++            r#"{"type":"activate","sessionId":"+17","slot":"Top"}"#,
++            r#"{"type":"activate","sessionId":"0","slot":"Top"}"#,
++            r#"{"type":"activate","sessionId":"18446744073709551616","slot":"Top"}"#,
++            r#"{"type":"activate","sessionId":"17","slot":"Top","action":"x"}"#,
++            r#"{"type":"cancel","sessionId":"17","slot":"Top"}"#,
++            r#"{"type":"launch","sessionId":"17"}"#,
++        ] {
++            assert!(session.command(line, now).is_err(), "accepted {line}");
++        }
++        session
++            .command(r#"{"type":"cancel","sessionId":"17"}"#, now)
++            .unwrap();
++    }
++
++    #[test]
++    fn an_expired_ring_is_cancelled_once_and_then_refuses_commands() {
++        let (mut session, now) = showing(17, &[ActionRingSlot::Top]);
++        assert_eq!(session.expire(now), None);
++        let later = now + DISPLAY_LIFETIME;
++        assert_eq!(
++            session.expire(later),
++            Some(OverlayCommand::Cancel { session_id: 17 })
++        );
++        assert_eq!(session.expire(later), None);
++        let late = session.command(
++            r#"{"type":"activate","sessionId":"17","slot":"Top"}"#,
++            later,
++        );
++        late.unwrap_err();
++    }
++
++    #[test]
++    fn a_late_observation_does_not_reopen_an_ended_ring() {
++        let (mut session, now) = showing(17, &[ActionRingSlot::Top]);
++        assert!(!session.show(&invocation(17, &[ActionRingSlot::Top]), now));
++        session
++            .command(r#"{"type":"cancel","sessionId":"17"}"#, now)
++            .unwrap();
++        assert!(!session.show(&invocation(17, &[ActionRingSlot::Top]), now));
++        assert!(session.show(&invocation(18, &[]), now));
++    }
++
++    #[test]
++    fn the_ring_message_keeps_display_order_ids_and_literal_labels() {
++        let ring = ring_message(&invocation(
++            BIG,
++            &[ActionRingSlot::Left, ActionRingSlot::Top],
++        ))
++        .unwrap();
++        let value = serde_json::to_value(&ring).unwrap();
++        assert_eq!(value["sessionId"], "9007199254740993");
++        assert_eq!(value["slots"][0]["slot"], "Top");
++        assert_eq!(value["slots"][1]["slot"], "Left");
++        assert_eq!(value["slots"][0]["label"], "Copy");
++        assert!(
++            value["slots"][0]["iconSvg"]
++                .as_str()
++                .unwrap()
++                .contains("<svg")
++        );
++        let (x, y) = ActionRingSlot::Left.placement(WINDOW_SIZE, RADIUS, SLOT_SIZE);
++        assert_eq!(value["slots"][1]["x"], serde_json::json!(x));
++        assert_eq!(value["slots"][1]["y"], serde_json::json!(y));
++    }
++}

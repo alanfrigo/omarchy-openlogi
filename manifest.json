@@ -1,0 +1,12 @@
+{
+  "schemaVersion": 1,
+  "id": "alanfrigo.openlogi",
+  "name": "OpenLogi",
+  "version": "0.1.0",
+  "author": "Alan Frigo",
+  "license": "MIT",
+  "description": "Native OpenLogi Action Ring overlay and connection status for Omarchy.",
+  "kinds": ["service", "overlay", "bar-widget"],
+  "entryPoints": {"service": "Service.qml", "overlay": "Overlay.qml", "barWidget": "BarWidget.qml"},
+  "barWidget": {"displayName": "OpenLogi", "category": "Hardware", "allowMultiple": false, "defaultSection": "right"}
+}

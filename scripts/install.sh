@@ -23,8 +23,12 @@ fail() {
 }
 for tool in flock jq omarchy omarchy-shell systemctl sha256sum cut find cmp; do command -v "$tool" >/dev/null || fail "$tool is required"; done
 export OMARCHY_SHELL_IPC_TIMEOUT=${OMARCHY_SHELL_IPC_TIMEOUT:-15s}
+[[ $state == /* ]] || fail "XDG path must be absolute: $state"
+[[ ! -L $state ]] || fail "unsafe state directory: $state"
 mkdir -p -- "$state"
-exec 9>"$state/.install.lock"
+[[ -d $state && ! -L $state && -O $state ]] || fail "unsafe state directory: $state"
+# Lock the owned directory without opening any user-controlled file for writing.
+exec 9<"$state"
 flock -n 9 || fail 'another OpenLogi installation/removal is running'
 [[ ! -e $receipt ]] || fail "installation receipt exists at $receipt; uninstall first (or resolve its reported conflicts)"
 for name in openlogi openlogi-agent openlogi-desktop openlogi-overlay; do

@@ -24,6 +24,6 @@ The ring appears on the cursor's monitor. Click a slot or use Tab and Enter/Spac
 bash scripts/uninstall.sh
 ```
 
-Disables the plugin and restores the previous service and desktop launcher. OpenLogi device configuration stays unchanged. Private binaries are removed only if they match the installation receipt; modified files are preserved, and removal stops on conflicts. The receipt lives at `~/.local/state/omarchy-openlogi/install/`. If installation fails, inspect the error and receipt before retrying; do not delete receipt files manually.
+Disables the plugin and restores the previous service and desktop launcher. OpenLogi device configuration stays unchanged. Private binaries are removed only if they match the installation receipt; modified files are preserved, and removal stops on conflicts. The receipt lives at `~/.local/state/omarchy-openlogi/install/`. Installation and removal lock the owned state directory without writing a lock file. If installation fails, inspect the error and receipt before retrying; do not delete receipt files manually.
 
-Local checks: `node check.mjs`, `omarchy plugin validate .`, and `bash -n scripts/*.sh`. `scripts/build-openlogi.sh` runs the Rust tests. Exercising a hardware action requires a configured button and a connected device; protocol tests do not replace that physical check.
+Local checks: `node check.mjs`, `bash tests/install-lock.sh`, `omarchy plugin validate .`, and `bash -n scripts/*.sh`. `scripts/build-openlogi.sh` runs the Rust tests. Exercising a hardware action requires a configured button and a connected device; protocol tests do not replace that physical check.

@@ -16,8 +16,9 @@ conflict=0
 rollback=${OPENLOGI_ROLLBACK:-0}
 
 fail() { printf 'uninstall-openlogi: %s\n' "$*" >&2; exit 1; }
+[[ -d $state && ! -L $state && -O $state ]] || fail "unsafe state directory: $state"
 [[ -d $receipt && ! -L $receipt ]] || fail "no installation receipt at $receipt"
-exec 9>"$state/.install.lock"
+exec 9<"$state"
 if [[ $rollback != 1 ]]; then flock -n 9 || fail 'another OpenLogi installation/removal is running'; fi
 for name in unit-state active-state plugin-enabled in-place; do [[ -f $receipt/$name ]] || fail "incomplete receipt: $name"; done
 original_enabled=$(<"$receipt/unit-state")

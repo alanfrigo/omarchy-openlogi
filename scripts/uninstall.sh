@@ -6,7 +6,7 @@ id=alanfrigo.openlogi
 data=${XDG_DATA_HOME:-$HOME/.local/share}
 config=${XDG_CONFIG_HOME:-$HOME/.config}
 state=${XDG_STATE_HOME:-$HOME/.local/state}/omarchy-openlogi
-bin=$data/omarchy-openlogi/0.8.10/bin
+bin=$data/omarchy-openlogi/bin
 unit=$data/systemd/user/openlogi-agent.service
 dropin=$config/systemd/user/openlogi-agent.service.d/omarchy-openlogi.conf
 desktop=$data/applications/openlogi.desktop
@@ -21,6 +21,13 @@ fail() { printf 'uninstall-openlogi: %s\n' "$*" >&2; exit 1; }
 exec 9<"$state"
 if [[ $rollback != 1 ]]; then flock -n 9 || fail 'another OpenLogi installation/removal is running'; fi
 for name in unit-state active-state plugin-enabled in-place; do [[ -f $receipt/$name ]] || fail "incomplete receipt: $name"; done
+# Legacy receipts predate the unversioned build directory.
+if [[ -f $receipt/bin-path && ! -L $receipt/bin-path ]]; then
+    bin=$(<"$receipt/bin-path")
+    [[ $bin == "$data/omarchy-openlogi/bin" ]] || fail 'invalid recorded binary path'
+else
+    bin=$data/omarchy-openlogi/0.8.10/bin
+fi
 original_enabled=$(<"$receipt/unit-state")
 original_active=$(<"$receipt/active-state")
 original_plugin=$(<"$receipt/plugin-enabled")
@@ -75,6 +82,7 @@ if [[ $owned_plugin != 1 ]]; then
     conflict=1
 fi
 (( conflict == 0 )) || fail 'resolve conflicts manually; installation receipt retained'
+[[ ${OPENLOGI_PREFLIGHT:-0} != 1 ]] || exit 0
 
 # Plugin is stopped before backend restoration; source tree stays untouched.
 if omarchy plugin list --json | jq -e --arg id "$id" 'any(.[]; .id == $id and .enabled == true)' >/dev/null; then

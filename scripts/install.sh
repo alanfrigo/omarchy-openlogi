@@ -7,13 +7,13 @@ root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 data=${XDG_DATA_HOME:-$HOME/.local/share}
 config=${XDG_CONFIG_HOME:-$HOME/.config}
 state=${XDG_STATE_HOME:-$HOME/.local/state}/omarchy-openlogi
-bin=$data/omarchy-openlogi/0.8.10/bin
+bin=$data/omarchy-openlogi/bin
 unit=$data/systemd/user/openlogi-agent.service
 dropin=$config/systemd/user/openlogi-agent.service.d/omarchy-openlogi.conf
 desktop=$data/applications/openlogi.desktop
 plugin=$config/omarchy/plugins/$id
 receipt=$state/install
-files=(manifest.json Service.qml Overlay.qml BarWidget.qml Model.js check.mjs scripts/build-openlogi.sh scripts/install.sh scripts/uninstall.sh patches/openlogi-0.8.10-external-overlay.patch)
+files=(manifest.json Service.qml Overlay.qml BarWidget.qml Model.js check.mjs scripts/build-openlogi.sh scripts/install.sh scripts/update.sh scripts/uninstall.sh patches/external-overlay.patch)
 
 transaction_live=0
 fail() {
@@ -28,21 +28,24 @@ export OMARCHY_SHELL_IPC_TIMEOUT=${OMARCHY_SHELL_IPC_TIMEOUT:-15s}
 mkdir -p -- "$state"
 [[ -d $state && ! -L $state && -O $state ]] || fail "unsafe state directory: $state"
 # Lock the owned directory without opening any user-controlled file for writing.
-exec 9<"$state"
-flock -n 9 || fail 'another OpenLogi installation/removal is running'
+if [[ ${OPENLOGI_UPDATE_LOCKED:-0} != 1 ]]; then
+    exec 9<"$state"
+    flock -n 9 || fail 'another OpenLogi installation/removal is running'
+fi
 [[ ! -e $receipt ]] || fail "installation receipt exists at $receipt; uninstall first (or resolve its reported conflicts)"
 for name in openlogi openlogi-agent openlogi-desktop openlogi-overlay; do
     [[ -x $bin/$name && ! -L $bin/$name ]] || fail "missing compatible private binary $bin/$name; run scripts/build-openlogi.sh"
 done
 [[ -f $bin/REVISION && ! -L $bin/REVISION ]] || fail "missing private build revision at $bin/REVISION"
-[[ $(<"$bin/REVISION") == 19036d7fe86abe11cdb628da11ff89aa5fb7a204 ]] || fail 'private binaries are not the pinned OpenLogi 0.8.10 revision'
+[[ $(<"$bin/REVISION") =~ ^[0-9a-f]{40}$ ]] || fail 'invalid private build revision'
+[[ -f $bin/RELEASE && ! -L $bin/RELEASE && $(<"$bin/RELEASE") =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail 'missing or invalid private build release'
 for name in LICENSE-MIT LICENSE-APACHE external-overlay.patch; do
     [[ -f $bin/$name && ! -L $bin/$name ]] || fail "incomplete private build: $bin/$name"
 done
-cmp -s -- "$bin/external-overlay.patch" "$root/patches/openlogi-0.8.10-external-overlay.patch" || fail 'private build patch does not match this plugin'
+cmp -s -- "$bin/external-overlay.patch" "$root/patches/external-overlay.patch" || fail 'private build patch does not match this plugin'
 for name in "$bin"/*; do
     case ${name##*/} in
-        openlogi|openlogi-agent|openlogi-desktop|openlogi-overlay|REVISION|LICENSE-MIT|LICENSE-APACHE|external-overlay.patch) ;;
+        openlogi|openlogi-agent|openlogi-desktop|openlogi-overlay|REVISION|RELEASE|LICENSE-MIT|LICENSE-APACHE|external-overlay.patch) ;;
         *) fail "unknown private build file: $name";;
     esac
 done
@@ -90,6 +93,7 @@ printf '%s\n' "$unit_state" >"$receipt/unit-state"
 printf '%s\n' "$active_state" >"$receipt/active-state"
 printf '%s\n' "$original_plugin" >"$receipt/plugin-enabled"
 printf '%s\n' "$in_place" >"$receipt/in-place"
+printf '%s\n' "$bin" >"$receipt/bin-path"
 for key in dropin desktop unit; do
     case $key in dropin) path=$dropin;; desktop) path=$desktop;; unit) path=$unit;; esac
     if [[ -f $path ]]; then cp -p -- "$path" "$receipt/$key.original"; else : >"$receipt/$key.absent"; fi

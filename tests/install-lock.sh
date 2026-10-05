@@ -25,7 +25,7 @@ fi
 
 exec 9<"$state"
 flock -n 9
-for script in install uninstall; do
+for script in install uninstall update; do
     if bash "$root/scripts/$script.sh" >"$tmp/output" 2>&1; then
         printf '%s ignored concurrent operation\n' "$script" >&2
         exit 1
@@ -35,4 +35,4 @@ for script in install uninstall; do
         exit 1
     }
 done
-printf 'install/uninstall preserve symlink targets and share state lock\n'
+printf 'install/uninstall/update preserve symlink targets and share state lock\n'

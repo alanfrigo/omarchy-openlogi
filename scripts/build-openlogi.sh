@@ -1,97 +1,84 @@
 #!/usr/bin/env bash
-# Build the four OpenLogi 0.8.10 binaries with the external overlay patch and
-# stage them in a private directory. Never touches /usr, PATH, or services.
+# Build a user-selected upstream release with the external overlay bridge.
 set -euo pipefail
 
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 readonly repository=https://github.com/AprilNEA/OpenLogi
-readonly revision=19036d7fe86abe11cdb628da11ff89aa5fb7a204
-readonly toolchain=1.98.0
-readonly patch=$root/patches/openlogi-0.8.10-external-overlay.patch
+readonly patch=$root/patches/external-overlay.patch
 cache=${XDG_CACHE_HOME:-$HOME/.cache}/omarchy-openlogi
-bin=${XDG_DATA_HOME:-$HOME/.local/share}/omarchy-openlogi/0.8.10/bin
+bin=${XDG_DATA_HOME:-$HOME/.local/share}/omarchy-openlogi/bin
 readonly binaries=(openlogi openlogi-agent openlogi-desktop openlogi-overlay)
-
 fail() { printf 'build-openlogi: %s\n' "$*" >&2; exit 1; }
-
-# The exact form the patch was generated in, independent of user git config.
-staged_patch() {
-    git -C "$1" diff --cached --full-index --no-color --no-ext-diff --no-textconv \
-        --diff-algorithm=myers --indent-heuristic --src-prefix=a/ --dst-prefix=b/
-}
-
-# pristine: the pinned revision, untouched. patched: exactly this patch,
-# staged. other: anything else, which is never modified here.
-checkout_state() {
-    local dir=$1
-    [[ $(git -C "$dir" rev-parse HEAD 2>/dev/null) == "$revision" ]] || { echo other; return; }
-    if [[ -z $(git -C "$dir" status --porcelain) ]]; then
-        echo pristine
-    elif git -C "$dir" diff --quiet &&
-        [[ -z $(git -C "$dir" ls-files --others --exclude-standard) ]] &&
-        staged_patch "$dir" | cmp -s - "$patch"; then
-        echo patched
-    else
-        echo other
-    fi
-}
-
-command -v rustup >/dev/null || fail "rustup is required (omarchy pkg add rustup)"
-rustup run "$toolchain" cargo --version >/dev/null 2>&1 ||
-    fail "Rust $toolchain is required (rustup toolchain install $toolchain --profile minimal --component rustfmt,clippy)"
+[[ $# -le 1 ]] || fail 'usage: build-openlogi.sh [vMAJOR.MINOR.PATCH]'
+for tool in git rustup jq curl flock; do command -v "$tool" >/dev/null || fail "$tool is required"; done
+release=${1:-$(curl --fail --silent --show-error https://api.github.com/repos/AprilNEA/OpenLogi/releases/latest | jq -er '.tag_name')}
+[[ $release =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "not a stable release tag: $release"
+[[ $bin == /* && $cache == /* ]] || fail 'XDG paths must be absolute'
+receipt=${XDG_STATE_HOME:-$HOME/.local/state}/omarchy-openlogi/install
+if [[ -f $receipt/bin-path && $(<"$receipt/bin-path") == "$bin" ]]; then
+    fail 'installed binaries must be updated with scripts/update.sh'
+fi
+[[ ! -L $bin && ( ! -e $bin || -d $bin ) ]] || fail "unsafe binary destination: $bin"
 [[ -f $patch ]] || fail "missing $patch"
-
-checkout=$cache/OpenLogi
-if [[ -e $checkout ]] && [[ $(checkout_state "$checkout") == other ]]; then
-    printf 'build-openlogi: %s has other changes; using a separate checkout\n' "$checkout" >&2
-    checkout=$cache/OpenLogi-$revision
-fi
+mkdir -p -- "$cache"
+exec 8<"$cache"
+flock -n 8 || fail 'another OpenLogi build is running'
+checkout=$cache/OpenLogi-$release
 if [[ ! -e $checkout ]]; then
-    mkdir -p -- "$cache"
-    git clone --no-checkout -- "$repository" "$checkout"
-    git -C "$checkout" checkout --quiet --detach "$revision"
+    git clone --depth 1 --branch "$release" -- "$repository" "$checkout"
 fi
-case $(checkout_state "$checkout") in
-    pristine)
-        git -C "$checkout" apply --index --check "$patch" || fail "patch does not apply to $checkout"
-        git -C "$checkout" apply --index "$patch"
-        ;;
-    patched) ;;
-    *) fail "$checkout is not the pinned revision with exactly this patch; nothing was built or installed" ;;
-esac
-
-(
-    cd -- "$checkout"
-    cargo "+$toolchain" test --locked -p openlogi-overlay
-    cargo "+$toolchain" test --locked -p openlogi-agent --bin openlogi-agent
-    cargo "+$toolchain" build --locked --release \
-        -p openlogi --bin openlogi \
+origin=$(git -C "$checkout" remote get-url origin)
+[[ ${origin%.git} == "$repository" ]] || fail "unexpected repository in $checkout"
+git -C "$checkout" fetch --depth 1 origin "refs/tags/$release"
+revision=$(git -C "$checkout" rev-parse 'FETCH_HEAD^{commit}')
+[[ $(git -C "$checkout" rev-parse HEAD) == "$revision" ]] || fail "different revision in $checkout; leave user checkout untouched"
+# Accept only pristine source or exactly our staged patch, never user edits.
+if [[ -z $(git -C "$checkout" status --porcelain) ]]; then
+    git -C "$checkout" apply --index --check "$patch" || fail "external overlay patch is incompatible with $release; current installation unchanged"
+    git -C "$checkout" apply --index "$patch"
+else
+    # Compare against applying this patch to the same upstream commit.
+    index=$(mktemp -- "$cache/.index.XXXXXX")
+    rm -- "$index"
+    trap 'rm -f -- "$index"' EXIT
+    GIT_INDEX_FILE=$index git -C "$checkout" read-tree "$revision"
+    GIT_INDEX_FILE=$index git -C "$checkout" apply --cached "$patch" || fail "patch is incompatible with $release"
+    [[ -z $(git -C "$checkout" ls-files --others --exclude-standard) ]] &&
+        git -C "$checkout" diff --quiet &&
+        [[ $(git -C "$checkout" write-tree) == $(GIT_INDEX_FILE=$index git -C "$checkout" write-tree) ]] ||
+        fail "user changes in $checkout; nothing built or installed"
+    rm -- "$index"
+    trap - EXIT
+fi
+# Use the selected release's own Rust requirement, not a plugin-pinned toolchain.
+(cd -- "$checkout" && cargo test --locked -p openlogi-overlay &&
+    cargo test --locked -p openlogi-agent --bin openlogi-agent &&
+    cargo build --locked --release -p openlogi --bin openlogi \
         -p openlogi-agent --bin openlogi-agent \
         -p openlogi-desktop --bin openlogi-desktop \
-        -p openlogi-overlay --bin openlogi-overlay
-)
+        -p openlogi-overlay --bin openlogi-overlay)
 
 parent=$(dirname -- "$bin")
 mkdir -p -- "$parent"
 stage=$(mktemp -d -- "$parent/.bin.stage.XXXXXX")
 previous=
-cleanup() { rm -rf -- "$stage" ${previous:+"$previous"}; }
+cleanup() {
+    local rc=$?
+    if [[ -n $previous && ! -e $bin ]]; then mv -- "$previous" "$bin"; previous=; fi
+    rm -rf -- "$stage" ${previous:+"$previous"}
+    return "$rc"
+}
 trap cleanup EXIT
-for name in "${binaries[@]}"; do
-    install -m 755 -- "$checkout/target/release/$name" "$stage/$name"
-done
-for license in LICENSE-MIT LICENSE-APACHE; do
-    install -m 644 -- "$checkout/$license" "$stage/$license"
-done
+for name in "${binaries[@]}"; do install -m 755 -- "$checkout/target/release/$name" "$stage/$name"; done
+for license in LICENSE-MIT LICENSE-APACHE; do install -m 644 -- "$checkout/$license" "$stage/$license"; done
 install -m 644 -- "$patch" "$stage/external-overlay.patch"
 printf '%s\n' "$revision" >"$stage/REVISION"
-"$stage/openlogi-overlay" --help >/dev/null || fail "built overlay does not run"
-
-# Running processes keep their old inode; the next start uses the new files.
+printf '%s\n' "$release" >"$stage/RELEASE"
+"$stage/openlogi-overlay" --help >/dev/null || fail 'built overlay does not run'
 if [[ -e $bin ]]; then
     previous=$(mktemp -d -- "$parent/.bin.previous.XXXXXX")
     rmdir -- "$previous"
     mv -- "$bin" "$previous"
 fi
 mv -- "$stage" "$bin"
-printf 'Installed compatible binaries in %s\n' "$bin"
+printf 'Built %s (%s) in %s\n' "$release" "$revision" "$bin"

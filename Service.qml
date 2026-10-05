@@ -8,7 +8,7 @@ Item {
 
   property var shell: null
   readonly property string home: Quickshell.env("HOME") || ""
-  readonly property string privateBin: (Quickshell.env("XDG_DATA_HOME") || home + "/.local/share") + "/omarchy-openlogi/0.8.10/bin"
+  readonly property string privateBin: (Quickshell.env("XDG_DATA_HOME") || home + "/.local/share") + "/omarchy-openlogi/bin"
   property string agentState: "connecting"
   property string inventoryState: "unknown"
   property var deviceNames: []
